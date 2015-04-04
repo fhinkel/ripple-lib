@@ -39,6 +39,8 @@ exports.sjcl = require('./utils').sjcl;
 exports.Wallet = require('ripple-wallet-generator')({sjcl: exports.sjcl});
 exports.types = require('./serializedtypes');
 
+exports.keypairs = require('./keypairs');
+
 // camelCase to under_scored API conversion
 function attachUnderscored(name) {
   const o = exports[name];

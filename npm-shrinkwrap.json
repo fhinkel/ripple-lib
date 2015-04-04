@@ -42,6 +42,11 @@
       "version": "1.0.2",
       "resolved": "https://registry.npmjs.org/sjcl/-/sjcl-1.0.2.tgz"
     },
+    "tweetnacl": {
+      "version": "0.13.1",
+      "from": "tweetnacl@>=0.13.0 <0.14.0",
+      "resolved": "https://registry.npmjs.org/tweetnacl/-/tweetnacl-0.13.1.tgz"
+    },
     "ws": {
       "version": "0.7.1",
       "resolved": "https://registry.npmjs.org/ws/-/ws-0.7.1.tgz",
