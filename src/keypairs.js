@@ -4,7 +4,10 @@
 
 var util = require('util');
 var nacl = require('tweetnacl');
+var lodash = require('lodash');
+
 var utils = require('./utils');
+var Base = require('./base').Base;
 var Seed = require('./seed').Seed;
 var UInt160 = require('./uint160').UInt160;
 var UInt256 = require('./uint256').UInt256;
@@ -28,7 +31,7 @@ function isVirtual() {
 
 function hasCachedProperty(obj, name, computer) {
   var key = name + '__';
-  obj[name] = function() {
+  obj.prototype[name] = function() {
     return this[key] !== undefined ? this[key] :
            this[key] = computer.call(this);
   };
@@ -42,11 +45,20 @@ function toGenericArray(typedArray) {
   return generic;
 }
 
+function bytesToHex(bytes) {
+  return arrayToHex(bytes).toUpperCase();
+}
+
 /*
+
+Seed.from_json is too loose, and discriminates between seed and passphrase via
+the first letter of the passed in string. This requires explicitly declaring
+what format the seed is in.
+
 @private
 @param {Object} opts
-@param {String} [opts.seedBase58] -
-@param {String} [opts.seedHex] -
+@param {String} [opts.base58] -
+@param {String} [opts.hex] -
 @param {String} [opts.passphrase] -
 @param {String} [opts.generic] -
  */
@@ -55,14 +67,14 @@ function parseSeed(opts) {
 
   if (opts.passphrase) {
     seed.parse_passphrase(opts.passphrase);
-  } else if (opts.seedBase58) {
-    seed.parse_base58(opts.seedBase58);
-  } else if (opts.seedHex) {
-    seed.parse_hex(opts.seedHex);
+  } else if (opts.base58) {
+    seed.parse_base58(opts.base58);
+  } else if (opts.hex) {
+    seed.parse_hex(opts.hex);
   } else if (opts.generic) {
     seed.parse_json(opts.generic);
   } else {
-    throw new Error('generic, seed, seed_hex, or passphrase must be supplied');
+    throw new Error('generic, base58, hex, or passphrase must be supplied');
   }
 
   return seed;
@@ -78,8 +90,88 @@ function deriveEdKeyPairSeed(seed) {
   return new Uint8Array(sjcl.codec.bytes.fromBits(bits));
 }
 
-function bytesToHex(bytes) {
-  return arrayToHex(bytes).toUpperCase();
+function findk256Key(seedBytes, discrim)
+{
+  var curve = sjcl.ecc.curves.k256;
+  var key;
+
+  for (var i = 0; i <= 0xFFFFFFFF; i++) {
+    // We hash the seedBytes to find a 256 bit number, looping until we are sure
+    // it is less than the order of the curve.
+    var hasher = new utils.Sha512().addBytes(seedBytes);
+    // If the optional discriminator index was passed in, update the hash.
+    if (discrim !== undefined) {
+      hasher.addU32(discrim);
+    };
+    hasher.addU32(i);
+    key = hasher.finish256BN();
+
+    /*
+    # js
+    >>> console.log(curve.r.toString(16).toUpperCase())
+    0XFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+    # python
+    >>> order = b'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
+    >>> import struct, hashlib, os
+    >>> randoms = lambda: (os.urandom(16) for i in range(2**12))
+    >>> h256 = lambda b, i: int(hashlib.sha512(b+struct.pack('>I', i)).hexdigest()[:64], 16)
+    >>> (2 ** 12) ** 2
+    16777216
+    >>> all(h256(r, i) < order for r in randoms() for i in range(2**12))
+    True
+
+    We basically always break here, but for the vanishingly rare case that we
+    don't we'll increment i and continue.  :)
+
+    */
+    if (curve.r.greaterEquals(key)) {
+      break;
+    }
+  }
+  return key;
+}
+
+/**
+* @param {Object} [options] -
+*
+* @param {Number} [options.accountIndex=0] - the account number to generate
+*
+* @param {Boolean} [options.root=false] - generate root key-pair,
+*                                         as used by validators.
+* @return {new sjcl.ecc.ecdsa.secretKey} -
+*
+*/
+function derivek256Secret(seed, options) {
+  if (!seed.is_valid()) {
+    throw new Error('Cannot generate keys from invalid seed!');
+  };
+
+  var curve = sjcl.ecc.curves.k256;
+  var opts = options || {};
+  var root = opts.root;
+
+  // This private generator represents the `root` private key, and is what's
+  // used by validators for signing when a keypair is generated from a seed.
+  var privateGen = findk256Key(seed.to_bytes());
+  var secret;
+
+  if (root) {
+    // As used by validation_create
+    secret = privateGen;
+  } else {
+    var publicGen = curve.G.mult(privateGen);
+
+    // A seed can generate many keypairs as a function of the seed and a uint32.
+    // Almost everyone just uses the first account, `0`.
+    var accountIndex = opts.accountIndex || 0;
+    var secret = findk256Key(publicGen.toBytesCompressed(), accountIndex)
+                             .add(privateGen).mod(curve.r);
+  }
+  // The public key is lazily computed by the key class, but it has the same
+  // mathematical relationship to `secret` as `publicGen` to `privateGen`. The
+  // `secret` will be available as the `_exponent` property on the secretKey.
+  return new sjcl.ecc.ecdsa.secretKey(curve, secret);
 }
 
 function bytesBnTo256Bits(bytes) {
@@ -88,36 +180,29 @@ function bytesBnTo256Bits(bytes) {
   return sjcl.bn.fromBits(bits).toBits(bitLength);
 }
 
-function createAccountId(publicKeyBytes) {
-  var bits = sjcl.codec.bytes.toBits(publicKeyBytes);
-  var hash = sjcl.hash.ripemd160.hash(sjcl.hash.sha256.hash(bits));
-  var id = UInt160.from_bits(hash);
-  id.set_version(0);
-  return id;
+function extractRSFromDER(signature) {
+  var rPos = 4;
+  var rLen = signature[3];
+  var sPos = rLen + 6;
+  var sLen = signature[rLen + 5];
+  var r = signature.slice(rPos, rPos + rLen);
+  var s = signature.slice(sPos, sPos + sLen);
+  var rs = sjcl.bitArray.concat(bytesBnTo256Bits(r),
+                                bytesBnTo256Bits(s));
+  return rs;
 }
 
-function stringifyKey(specifier) {
-  if (typeof specifier === 'object') {
-    var sorted = {};
-    Object.keys(specifier).forEach(function(k) {
-      sorted[k] = specifier[k];
-    });
-    return JSON.stringify(sorted);
-  }
-
-  return JSON.stringify(specifier);
+function createAccountId(pubKeyBytes) {
+  var bits = sjcl.codec.bytes.toBits(pubKeyBytes);
+  var hash = sjcl.hash.ripemd160.hash(sjcl.hash.sha256.hash(bits));
+  var id = UInt160.from_bits(hash);
+  id.set_version(Base.VER_ACCOUNT_ID);
+  return id;
 }
 
 /* --------------------------------- KEYPAIR -------------------------------- */
 
-/*
-@param {Seed} seed - 128 bit seed value
-@param {Object|String} specifier - the specifier for the KeyPair
- */
-function KeyPair(seed, specifier) {
-  this.seed = seed;
-  this.specifier = specifier;
-}
+function KeyPair() {}
 
 /*
 @param {Array} message
@@ -139,11 +224,11 @@ KeyPair.prototype.verify = isVirtual;
 */
 KeyPair.prototype.pubKeyBytes = isVirtual;
 
-hasCachedProperty(KeyPair.prototype, 'pubKeyHex', function() {
+hasCachedProperty(KeyPair, 'pubKeyHex', function() {
   return bytesToHex(this.pubKeyBytes());
 });
 
-hasCachedProperty(KeyPair.prototype, 'account', function() {
+hasCachedProperty(KeyPair, 'account', function() {
   return createAccountId(this.pubKeyBytes());
 });
 
@@ -156,11 +241,11 @@ KeyPair.prototype.signHex = function(message) {
 /*
 * @class
 * @private
+* @param {Object} - obj secretKey/publicKey Uint8Array members
+*                   (as returned by nacl.sign.keyPair)
 */
-function Ed25519Pair() {
+function Ed25519Pair(keyPair) {
   KeyPair.apply(this, arguments);
-  var secretBytes = deriveEdKeyPairSeed(this.seed);
-  var keyPair = nacl.sign.keyPair.fromSeed(secretBytes);
   this.secretKey = keyPair.secretKey;
   this.publicKey = keyPair.publicKey;
   this.type = KeyType.ed25519;
@@ -168,7 +253,16 @@ function Ed25519Pair() {
 
 util.inherits(Ed25519Pair, KeyPair);
 
-hasCachedProperty(Ed25519Pair.prototype, 'pubKeyBytes', function() {
+/**
+* @param {Seed} seed - A 128 bit seed
+*/
+Ed25519Pair.fromSeed = function(seed) {
+  var seed256 = deriveEdKeyPairSeed(seed);
+  var keyPair = nacl.sign.keyPair.fromSeed(seed256);
+  return new Ed25519Pair(keyPair);
+}
+
+hasCachedProperty(Ed25519Pair, 'pubKeyBytes', function() {
   return [0xED].concat(toGenericArray(this.publicKey));
 });
 
@@ -191,63 +285,62 @@ Ed25519Pair.prototype.verify = function(message, signature) {
 * @class
 * @private
 */
-function Secp256k1Pair() {
+function Secp256k1Pair(secretKey) {
   KeyPair.apply(this, arguments);
-  this.keyPair = this.seed.get_key();
+  this.secretKey = secretKey;
   this.type = KeyType.secp256k1;
+  this.curve = sjcl.ecc.curves.k256;
 }
 
 util.inherits(Secp256k1Pair, KeyPair);
 
-hasCachedProperty(Secp256k1Pair.prototype, 'pubKeyBytes', function() {
-  return hexToArray(this.keyPair.to_hex_pub());
+Secp256k1Pair.fromSeed = function(seed) {
+  return new Secp256k1Pair(derivek256Secret(seed));
+}
+
+hasCachedProperty(Secp256k1Pair, 'pubKey', function() {
+  var exponent = this.secretKey._exponent;
+  return new sjcl.ecc.ecdsa.publicKey(this.curve, this.curve.G.mult(exponent));
 });
 
-function Crypt_hashSha512Half(data) {
-  var hex = sjcl.codec.hex.fromBits(sjcl.hash.sha512.hash(data));
-  return UInt256.from_hex(hex.substr(0, 64));
-}
+hasCachedProperty(Secp256k1Pair, 'pubKeyBytes', function() {
+  return this.pubKey()._point.toBytesCompressed();
+});
 
 /*
 @param {Array<Number>} message (bytes)
  */
 Secp256k1Pair.prototype.sign = function(message) {
+  var PARANOIA_256_BITS = 6; // sjcl constant for ensuring 256 bits of entropy
   var hash = this.hashMessage(message);
-  var signatureBits = this.keyPair.sign(hash);
-  return sjcl.codec.bytes.fromBits(signatureBits);
+  var sig = this.secretKey.sign(hash, PARANOIA_256_BITS);
+  sig = this.secretKey.canonicalizeSignature(sig);
+  return sjcl.codec.bytes.fromBits(this.secretKey.encodeDER(sig));
 };
 
 /*
 @param {Array<Number>} message (bytes)
-@return {UInt256} 256 bit hash of the message
+@return {sjcl.bitArray} 256 bit hash of the message
  */
 Secp256k1Pair.prototype.hashMessage = function(message) {
-  var bits = sjcl.codec.bytes.toBits(message);
-  return Crypt_hashSha512Half(bits);
+  return new utils.Sha512().addBytes(message).finish256Bits();
 };
 
 /*
-@param {Array<Number>} message (bytes)
-@param {Array<Number>} signature (bytes)
+@param {Array<Number>} message - bytes
+@param {Array<Number>} signature - DER encoded signature bytes
  */
 Secp256k1Pair.prototype.verify = function(message, signature) {
-  var sig = signature;
-  var rPos = 4;
-  var rLen = sig[3];
-  var sPos = rLen + 6;
-  var sLen = sig[rLen + 5];
-  var r = sig.slice(rPos, rPos + rLen);
-  var s = sig.slice(sPos, sPos + sLen);
-  var rs = sjcl.bitArray.concat(bytesBnTo256Bits(r),
-                                bytesBnTo256Bits(s));
   try {
-    return this.keyPair._pub().verify(this.hashMessage(message).to_bits(), rs);
+    return this.pubKey().verify(this.hashMessage(message),
+                                extractRSFromDER(signature));
   } catch (e) {
     return false;
   }
 };
 
 exports.getKeyPair = function(specifier) {
+  // TODO: take seed, or base58 encoded secretKey
   if (specifier instanceof KeyPair) {
     return specifier;
   }
@@ -264,25 +357,15 @@ exports.getKeyPair = function(specifier) {
   }
 
   var seed = parseSeed(specifierObj);
+  if (lodash.isEqual(seed._version, Base.VER_ED25519_SEED)) {
+    keyType = KeyType.ed25519;
+  };
 
   if (keyType === KeyType.secp256k1) {
-    return new Secp256k1Pair(seed, specifier);
+    return Secp256k1Pair.fromSeed(seed);
   } else if (keyType === KeyType.ed25519) {
-    return new Ed25519Pair(seed, specifier);
+    return Ed25519Pair.fromSeed(seed);
   }
 
   throw new Error('unknown key_type ' + keyType);
-};
-
-exports.keyPairCache = {};
-
-exports.getCachedKeyPair = function(specifier) {
-  if (specifier instanceof KeyPair) {
-    return specifier;
-  }
-
-  var cache = exports.keyPairCache;
-  var key = stringifyKey(specifier);
-
-  return cache[key] ? cache[key] : cache[key] = exports.getKeyPair(specifier);
 };
