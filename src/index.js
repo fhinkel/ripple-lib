@@ -42,6 +42,8 @@ exports.types = require('./serializedtypes');
 exports.keypairs = require('./keypairs');
 exports.getKeyPair = exports.keypairs.getKeyPair;
 
+exports.keypairs = require('./keypairs');
+
 // camelCase to under_scored API conversion
 function attachUnderscored(name) {
   const o = exports[name];
