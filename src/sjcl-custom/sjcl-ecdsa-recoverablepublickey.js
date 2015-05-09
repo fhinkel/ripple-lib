@@ -241,7 +241,14 @@ sjcl.ecc.ecdsa.secretKey.prototype.signWithRecoverablePublicKey = function(
   }
 
   // Sign hash with standard, canonicalized method
-  var standard_signature = self.sign(hash_bits, paranoia, k_for_testing);
+  if (k_for_testing && !(k_for_testing instanceof sjcl.bn)) {
+    k_for_testing = new sjcl.bn(k_for_testing);
+  };
+
+  var standard_signature = k_for_testing ?
+        self.sign(hash_bits, paranoia, undefined, k_for_testing) :
+        self.signDeterministic(hash_bits)
+
   var canonical_signature = self.canonicalizeSignature(standard_signature);
 
   // Extract r and s signature components from canonical signature
